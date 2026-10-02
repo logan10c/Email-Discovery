@@ -40,7 +40,7 @@
 
           <div>
             <label class="block text-xs font-semibold uppercase tracking-wider text-slate-500 mb-1">Targets (Companies or Domains)</label>
-            <textarea id="targetList" rows="6" placeholder="marjacpoultry&#10;continentalmills&#10;target.com" class="w-full px-3 py-2 border border-slate-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:outline-none text-sm font-mono"></textarea>
+            <textarea id="targetList" rows="6" placeholder="marjacpoultry&#10;continentalmills&#10;target.com&#10;Sargento Foods" class="w-full px-3 py-2 border border-slate-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:outline-none text-sm font-mono"></textarea>
             <p class="text-xs text-slate-400 mt-1">Enter one domain or company name per line.</p>
           </div>
 
@@ -157,7 +157,13 @@
 
       const domain = email.split("@")[1].toLowerCase().trim();
       const domainRoot = domain.split(".")[0];
-      const targetClean = targetInput.toLowerCase().trim().replace(/[^a-z0-9]/g, "");
+      
+      // Clean up target name (remove spaces, punctuation, common legal suffixes)
+      const targetClean = targetInput
+        .toLowerCase()
+        .replace(/\b(inc|llc|corp|corporation|co|company|foods|group|holdings|services|ltd)\b/g, "")
+        .replace(/[^a-z0-9]/g, "")
+        .trim();
 
       // 1. Direct domain match
       if (targetInput.toLowerCase().includes(".") && domain === targetInput.toLowerCase()) {
@@ -206,63 +212,92 @@
         statusCount.innerText = `${i + 1}/${targets.length}`;
 
         const isDomain = target.includes(".") && !target.includes(" ");
-        const endpoint = isDomain 
-          ? `https://api.hunter.io/v2/domain-search?domain=${encodeURIComponent(target)}&api_key=${apiKey}&limit=10`
-          : `https://api.hunter.io/v2/domain-search?company=${encodeURIComponent(target)}&api_key=${apiKey}&limit=10`;
+        let endpointsToTry = [];
 
-        try {
-          const res = await fetch(endpoint);
-          if (res.ok) {
-            const data = await res.json();
-            const emails = data.data?.emails || [];
+        if (isDomain) {
+          endpointsToTry.push(`https://api.hunter.io/v2/domain-search?domain=${encodeURIComponent(target)}&api_key=${apiKey}&limit=10`);
+        } else {
+          // Clean target name: remove legal words ("foods", "inc", "corp")
+          const cleanRoot = target
+            .toLowerCase()
+            .replace(/\b(inc|llc|corp|corporation|co|company|foods|group|holdings|services|ltd)\b/g, "")
+            .replace(/[^a-z0-9]/g, "")
+            .trim();
 
-            const validContacts = [];
-            for (const item of emails) {
-              const emailVal = item.value;
-              
-              // Skip generic email addresses
-              if (isGenericEmail(emailVal, item.type)) continue;
-
-              const title = item.position || item.seniority || "N/A";
-              const audit = verifyMatch(target, emailVal);
-
-              validContacts.push({
-                target_company: target,
-                first_name: item.first_name || "Unknown",
-                last_name: item.last_name || "Unknown",
-                job_title: title,
-                email: emailVal,
-                verification_status: item.verification?.status || "unverified",
-                score: scoreJobTitle(title),
-                match_status: audit.match_status,
-                matched_domain: audit.matched_domain
-              });
-            }
-
-            if (validContacts.length > 0) {
-              // Priority sorting: prefers Exact Match first, then higher job score
-              validContacts.sort((a, b) => {
-                if (a.match_status === "Exact Match" && b.match_status !== "Exact Match") return -1;
-                if (b.match_status === "Exact Match" && a.match_status !== "Exact Match") return 1;
-                return b.score - a.score;
-              });
-
-              const bestMatch = validContacts[0];
-
-              // Deduplication check
-              const emailKey = bestMatch.email.toLowerCase();
-              if (!seenEmails.has(emailKey)) {
-                seenEmails.add(emailKey);
-                masterLeads.push(bestMatch);
-                addedInThisRun++;
-                appendLeadToTable(bestMatch);
-              }
-            } else {
-              skippedCount++;
-            }
+          // Strategy 1: Explicit inferred .com domain (e.g. sargento.com)
+          if (cleanRoot.length > 2) {
+            endpointsToTry.push(`https://api.hunter.io/v2/domain-search?domain=${encodeURIComponent(cleanRoot + ".com")}&api_key=${apiKey}&limit=10`);
           }
-        } catch (err) {
-          console.error(`Error searching '${target}':`, err);
+
+          // Strategy 2: Raw company search
+          endpointsToTry.push(`https://api.hunter.io/v2/domain-search?company=${encodeURIComponent(target)}&api_key=${apiKey}&limit=10`);
+        }
+
+        let emails = [];
+        let successfulDomain = "";
+
+        // Try candidate endpoints until we receive valid non-empty emails
+        for (const endpoint of endpointsToTry) {
+          try {
+            const res = await fetch(endpoint);
+            if (res.ok) {
+              const data = await res.json();
+              const retrievedEmails = data.data?.emails || [];
+
+              if (retrievedEmails.length > 0) {
+                emails = retrievedEmails;
+                successfulDomain = data.data?.domain || "";
+                break; // Stop trying fallbacks if we found emails
+              }
+            }
+          } catch (err) {
+            console.error(`Error querying endpoint '${endpoint}':`, err);
+          }
+        }
+
+        const validContacts = [];
+        for (const item of emails) {
+          const emailVal = item.value;
+          
+          // Skip generic email addresses
+          if (isGenericEmail(emailVal, item.type)) continue;
+
+          const title = item.position || item.seniority || "N/A";
+          const audit = verifyMatch(target, emailVal);
+
+          validContacts.push({
+            target_company: target,
+            first_name: item.first_name || "Unknown",
+            last_name: item.last_name || "Unknown",
+            job_title: title,
+            email: emailVal,
+            verification_status: item.verification?.status || "unverified",
+            score: scoreJobTitle(title),
+            match_status: audit.match_status,
+            matched_domain: audit.matched_domain
+          });
+        }
+
+        if (validContacts.length > 0) {
+          // Priority sorting: prefers Exact Match first, then higher job score
+          validContacts.sort((a, b) => {
+            if (a.match_status === "Exact Match" && b.match_status !== "Exact Match") return -1;
+            if (b.match_status === "Exact Match" && a.match_status !== "Exact Match") return 1;
+            return b.score - a.score;
+          });
+
+          const bestMatch = validContacts[0];
+
+          // Deduplication check
+          const emailKey = bestMatch.email.toLowerCase();
+          if (!seenEmails.has(emailKey)) {
+            seenEmails.add(emailKey);
+            masterLeads.push(bestMatch);
+            addedInThisRun++;
+            appendLeadToTable(bestMatch);
+          }
+        } else {
+          skippedCount++;
         }
 
         await new Promise(r => setTimeout(r, 200));
